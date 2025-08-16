@@ -5,16 +5,9 @@
   (:use :cl
         :alexandria)
   (:export :make-options
-           :spawn
-           :query))
+           :query
+           :receive))
 (in-package :claude-code)
-
-(defmethod print-object ((object hash-table) stream)
-  (print-unreadable-object (object stream :type t)
-    (prin1 (alexandria:hash-table-alist object) stream)))
-
-(defun hash (&rest args)
-  (alexandria:plist-hash-table args :test 'equal))
 
 (defstruct (claude-code-options (:constructor make-options))
   allowed-tools
@@ -39,7 +32,7 @@
 (defun construct-command (prompt options)
   `("claude"
     "--output-format" "stream-json"
-    "--verbose" 
+    "--verbose"
     "--print" ,prompt
     ,@(when (claude-code-options-system-prompt options)
         (list "--system-prompt" (claude-code-options-system-prompt options)))
@@ -80,27 +73,21 @@
           (t
            (list "--mcp-config" (princ-to-string (claude-code-options-mcp-servers options))))))))
 
-(defstruct client
+(defstruct session
+  process
   thread
-  mailbox
-  mailbox-for-interrupt
-  (request-counter 0))
-
-(defun yield (client &key (wait t) timeout)
-  (check-type client client)
-  (cond (wait
-         (lem-mailbox:receive-message (client-mailbox client) :timeout timeout))
-        (t
-         (lem-mailbox:receive-message-no-hang (client-mailbox client)))))
+  response-mailbox
+  prompt-mailbox)
 
 (defun receive-message (process)
   (check-type process async-process::process)
   (loop :with buffer := ""
         :do (let ((data (async-process:process-receive-output process)))
-              (when data (format t "output: ~A~%" data))
+              ;; (format t "output: ~A~%" data)
+              (unless data
+                (return))
               (setf buffer (concatenate 'string buffer data))
-              (handler-case
-                  (yason:parse buffer)
+              (handler-case (yason:parse buffer)
                 (error ()
                   ;; If there is a parse error, the input is incomplete.
                   )
@@ -109,60 +96,42 @@
             (sleep 0.1)
         :while (async-process:process-alive-p process)))
 
-(defun spawn (prompt options)
-  (let* ((mailbox (lem-mailbox:make-mailbox :name "Claude Code mailbox"))
-         (mailbox-for-interrupt (lem-mailbox:make-mailbox 
-                                 :name "Claude Code mailbox-for-interrupt")))
-    (make-client
-     :mailbox mailbox
-     :mailbox-for-interrupt mailbox-for-interrupt
+(defun query (prompt &optional (options (make-options)))
+  (let* ((response-mailbox (sb-concurrency:make-mailbox :name "Claude Code response-mailbox"))
+         (prompt-mailbox (sb-concurrency:make-mailbox :name "Claude Code prompt-mailbox"))
+         (process
+           (async-process:create-process
+            (construct-command prompt options))))
+    (make-session
+     :process process
+     :response-mailbox response-mailbox
+     :prompt-mailbox prompt-mailbox
      :thread (bt2:make-thread
               (lambda ()
-                (let* ((process
-                         (async-process:create-process
-                          (construct-command prompt options)
-                          :nonblock t)))
-                  (loop
-                    :do
-                       (when-let (message (lem-mailbox:receive-message-no-hang
-                                           mailbox-for-interrupt))
-                         (format t "send-message: ~A~%" message)
-                         (async-process:process-send-input process message))
-                       (let ((value (receive-message process)))
-                         (when value
-                           (format t "receive-message: ~A~%" value)
-                           (lem-mailbox:send-message mailbox value)))
-                    :while (async-process:process-alive-p process))))
+                (loop
+                  :do (when-let (message (sb-concurrency:receive-message-no-hang
+                                          prompt-mailbox))
+                        ;; (format t "send-message: ~A~%" message)
+                        (async-process:process-send-input process message))
+                      (when-let ((value (receive-message process)))
+                        ;; (format t "receive-message: ~A~%" value)
+                        (sb-concurrency:send-message response-mailbox value))
+                  :while (async-process:process-alive-p process)))
               :name "Claude Code thread"))))
 
-(defun query (client prompt &key (session-id "default"))
-  (check-type client client)
-  (lem-mailbox:send-message (client-mailbox-for-interrupt client) 
-                            (json-encode
-                             (hash "type" "user"
-                                   "message" (hash "role" "user"
-                                                   "content" prompt)
-                                   "session_id" session-id))))
+(defmethod receive ((session session) &key (wait t) timeout)
+  (cond (wait
+         (sb-concurrency:receive-message (session-response-mailbox session) :timeout timeout))
+        (t
+         (sb-concurrency:receive-message-no-hang (session-response-mailbox session)))))
 
-
-;;; This code may not work properly.
+(eval-when ()
+  (let ((session (query "hello")))
+    (loop :for message := (receive session)
+          :until (equal "result" (gethash "type" message))
+          :do (print message))))
 
-(defun new-request-id (client)
-  (check-type client client)
-  (format nil
-          "req_~D_~X"
-          (incf (client-request-counter client))
-          (random most-positive-fixnum)))
-
-(defun generate-interrupt-message (request-id)
-  (with-output-to-string (out)
-    (yason:encode (hash "type" "control_request"
-                        "request_id" request-id
-                        "request" (hash "subtype" "interrupt"))
-                  out)))
-
-(defun interrupt (client)
-  (check-type client client)
-  (let* ((request-id (new-request-id client))
-         (message (generate-interrupt-message request-id)))
-    (lem-mailbox:send-message (client-mailbox-for-interrupt client) message)))
+#+(or)
+(defmethod print-object ((object hash-table) stream)
+  (print-unreadable-object (object stream :type t)
+    (prin1 (alexandria:hash-table-alist object) stream)))

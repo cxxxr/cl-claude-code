@@ -2,6 +2,7 @@
   :depends-on ("alexandria"
                "yason"
                "async-process"
-               "lem-mailbox")
+               "sb-concurrency"
+               "bordeaux-threads")
   :serial t
   :components ((:file "claude-code")))
